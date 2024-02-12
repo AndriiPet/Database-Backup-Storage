@@ -163,42 +163,50 @@ class Program
         }
     }
 
-    //Uploading a file to an FTP server
-    static void UploadFileToFtp(string ftpServer, string userName, string password, string fileName, string localFilePath, string serverFolder)
+   
+    private static readonly object ConsoleLock = new object();
+
+    public static void UploadFileToFtp(string ftpServer, string userName, string password, string fileName, string localFilePath, string serverFolder)
     {
         try
         {
-            // Generate a unique file name for the copy
-            string uniqueFileName = $"{Path.GetFileNameWithoutExtension(fileName)}_{Guid.NewGuid()}{Path.GetExtension(fileName)}";
-            string tempFilePath = Path.Combine(Path.GetTempPath(), uniqueFileName);
-
-            // Copy the original file to the temporary location
-            File.Copy(localFilePath, tempFilePath, true);
-
             // Connecting to an FTP server
-            string path = $"{ftpServer}{serverFolder}{uniqueFileName.Replace("\\", "/")}";
-            FtpWebRequest request = (FtpWebRequest)WebRequest.Create(path);
+            string path = $"{ftpServer}{serverFolder}{fileName.Replace("\\", "/")}";
+            string tempFilePath = Path.GetTempFileName();
+            File.Copy(localFilePath, tempFilePath, true);
+            long fileSize = new FileInfo(tempFilePath).Length;
 
-            request.Method = WebRequestMethods.Ftp.UploadFile;
-            request.Credentials = new NetworkCredential(userName, password);
+            Console.WriteLine($"Uploading file: {fileName}, Size: {fileSize / (1024 * 1024)} MB");
 
-            // Read file content into byte array
-            byte[] fileContents = File.ReadAllBytes(tempFilePath);
+            // Start multiple threads for uploading
+            const int numThreads = 8; // Define the number of threads
+            CountdownEvent countdownEvent = new CountdownEvent(numThreads);
 
-            using (Stream ftpStream = request.GetRequestStream())
+            // Initialize the progress bar
+            int progressBarWidth = 50;
+            Console.Write("[");
+            for (int i = 0; i < progressBarWidth; i++)
             {
-                ftpStream.Write(fileContents, 0, fileContents.Length);
+                Console.Write(" ");
+            }
+            Console.Write("]");
+            Console.SetCursorPosition(1, Console.CursorTop);
+
+            for (int i = 0; i < numThreads; i++)
+            {
+                ThreadPool.QueueUserWorkItem(new WaitCallback((threadIndex) =>
+                {
+                    int index = (int)threadIndex;
+                    long startOffset = index * (fileSize / numThreads);
+                    long endOffset = (index == numThreads - 1) ? fileSize : (index + 1) * (fileSize / numThreads);
+                    UploadChunk(ftpServer, userName, password, fileName, tempFilePath, startOffset, endOffset, fileSize, progressBarWidth, serverFolder);
+                    countdownEvent.Signal();
+                }), i);
             }
 
-            Console.WriteLine("\nFile uploaded successfully.");
+            countdownEvent.Wait(); // Wait for all threads to finish
 
-            // Delete temporary file
-            File.Delete(tempFilePath);
-        }
-        catch (WebException ex)
-        {
-            Console.WriteLine($"FTP Error: {ex.Message}");
-            // Handle specific FTP errors here if needed
+            Console.WriteLine("\nFile uploaded successfully.");
         }
         catch (Exception ex)
         {
@@ -207,10 +215,63 @@ class Program
         }
     }
 
+    private static void UploadChunk(string ftpServer, string userName, string password, string fileName, string localFilePath, long startOffset, long endOffset, long fileSize, int progressBarWidth, string serverFolder)
+    {
+        try
+        {
+            string path = $"{ftpServer}{serverFolder}{fileName.Replace("\\", "/")}";
+            FtpWebRequest request = (FtpWebRequest)WebRequest.Create(path);
+            request.Method = WebRequestMethods.Ftp.UploadFile;
+            request.Credentials = new NetworkCredential(userName, password);
 
+            using (FileStream fileStream = File.OpenRead(localFilePath))
+            {
+                // Set the file position for this thread
+                fileStream.Position = startOffset;
 
+                // Set the content length for this thread
+                long contentLength = endOffset - startOffset;
+                request.ContentLength = contentLength;
 
+                using (Stream ftpStream = request.GetRequestStream())
+                {
+                    byte[] buffer = new byte[1000000];
+                    int bytesRead;
+                    long totalBytesRead = 0;
 
+                    DateTime startTime = DateTime.Now;
+
+                    while ((bytesRead = fileStream.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        ftpStream.Write(buffer, 0, bytesRead);
+                        totalBytesRead += bytesRead;
+
+                        // Calculate percentage completed
+                        double percentage = ((double)(startOffset + totalBytesRead) / fileSize) * 100;
+
+                        // Calculate upload speed
+                        TimeSpan elapsedTime = DateTime.Now - startTime;
+                        double uploadSpeed = totalBytesRead / elapsedTime.TotalSeconds;
+
+                        // Update progress
+                        int completedBars = (int)(percentage / (100.0 / progressBarWidth));
+                        string progressBar = new string('█', completedBars) + new string('-', progressBarWidth - completedBars);
+                        lock (ConsoleLock)
+                        {
+                            Console.SetCursorPosition(1, Console.CursorTop);
+                            Console.Write(progressBar);
+                            Console.Write($" {percentage:F2}% uploaded, Speed: {uploadSpeed / (1024 * 1024):F2} MB/s".PadRight(50));
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}");
+            // Handle other exceptions here if needed
+        }
+    }
 
 
     static void DeleteFiles(string ftpServer, string ftpFolder, string ftpUsername, string ftpPassword, int fileAge)
